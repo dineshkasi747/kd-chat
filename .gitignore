@@ -1,0 +1,55 @@
+# ================================
+# ENVIRONMENT VARIABLES
+# ================================
+.env
+.env.local
+.env.production
+
+# ================================
+# NODE MODULES
+# ================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ================================
+# LOGS
+# ================================
+logs/
+*.log
+
+# ================================
+# OS FILES
+# ================================
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# ================================
+# EDITOR FILES
+# ================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ================================
+# BUILD OUTPUT
+# ================================
+dist/
+build/
+
+# ================================
+# FIREBASE
+# ================================
+firebase-service-account.json
+*-service-account.json
+serviceAccount.json
+
+# ================================
+# UPLOADS (if any local storage)
+# ================================
+uploads/
+temp/
