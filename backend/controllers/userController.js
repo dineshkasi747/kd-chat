@@ -2,6 +2,21 @@ import User from "../models/User.js";
 import { deleteFromCloudinary } from "../config/cloudinary.js";
 
 // ================================
+// HELPER — NORMALIZE PHONE NUMBER
+// Ensures consistent format for search
+// ================================
+const normalizePhone = (phone) => {
+  if (!phone) return "";
+  // Remove spaces, dashes, parentheses
+  let normalized = phone.toString().replace(/[\s\-\(\)]/g, "").trim();
+  // Ensure it starts with +
+  if (!normalized.startsWith("+")) {
+    normalized = "+" + normalized;
+  }
+  return normalized;
+};
+
+// ================================
 // GET USER PROFILE BY ID
 // GET /api/users/:userId
 // ================================
@@ -69,10 +84,7 @@ export const updateProfile = async (req, res) => {
         "profilePicPublicId"
       );
       if (currentUser.profilePicPublicId) {
-        await deleteFromCloudinary(
-          currentUser.profilePicPublicId,
-          "image"
-        );
+        await deleteFromCloudinary(currentUser.profilePicPublicId, "image");
       }
 
       updateData.profilePic = req.mediaInfo.mediaUrl;
@@ -163,11 +175,17 @@ export const syncContacts = async (req, res) => {
       });
     }
 
-    // Limit to 1000 contacts per request
-    const limitedNumbers = phoneNumbers.slice(0, 1000);
+    // Normalize all incoming phone numbers
+    const normalizedNumbers = phoneNumbers
+      .slice(0, 1000)
+      .map((n) => normalizePhone(n))
+      .filter((n) => n.length > 0);
 
-    // Find registered users
-    const registeredContacts = await User.findContacts(limitedNumbers);
+    // Find registered users with normalized numbers
+    const registeredContacts = await User.find({
+      phoneNumber: { $in: normalizedNumbers },
+      isActive: true,
+    }).select("name phoneNumber profilePic isOnline lastSeen about");
 
     // Filter out current user and blocked users
     const currentUser = await User.findById(currentUserId).select(
@@ -320,10 +338,12 @@ export const updateFcmToken = async (req, res) => {
 // ================================
 // SEARCH USERS BY PHONE
 // GET /api/users/search?phone=+91XXXXXXXXXX
+// FIX: Normalize phone before searching +
+//      flexible regex fallback if exact fails
 // ================================
 export const searchByPhone = async (req, res) => {
   try {
-    const { phone } = req.query;
+    let { phone } = req.query;
     const currentUserId = req.user._id;
 
     if (!phone) {
@@ -333,12 +353,31 @@ export const searchByPhone = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({
-      phoneNumber: phone,
+    // Normalize the incoming phone number
+    const normalizedPhone = normalizePhone(phone);
+    console.log(`[searchByPhone] raw="${phone}" normalized="${normalizedPhone}"`);
+
+    // Try exact match first (fastest)
+    let user = await User.findOne({
+      phoneNumber: normalizedPhone,
       isActive: true,
     }).select("name phoneNumber profilePic about isOnline lastSeen");
 
+    // Fallback: try suffix match in case country code differs
+    // e.g. stored "+919876543210", search "9876543210"
     if (!user) {
+      const digits = normalizedPhone.replace(/\D/g, ""); // strip non-digits
+      user = await User.findOne({
+        phoneNumber: { $regex: digits + "$" },
+        isActive: true,
+      }).select("name phoneNumber profilePic about isOnline lastSeen");
+      if (user) {
+        console.log(`[searchByPhone] Found via suffix match for digits="${digits}"`);
+      }
+    }
+
+    if (!user) {
+      console.log(`[searchByPhone] No user found for "${normalizedPhone}"`);
       return res.status(404).json({
         success: false,
         message: "No user found with this number.",
@@ -402,11 +441,8 @@ const applyPrivacySettings = (user, viewerId) => {
 
 // ================================
 // HELPER — IS CONTACT CHECK
-// (simplified — extend with
-// actual contacts list if needed)
 // ================================
 const isContact = (user, viewerId) => {
-  // In a real app, check if viewerId is in user's contact list
-  // For now returns true — extend based on your contacts model
+  // Extend this with real contacts list if needed
   return true;
 };
