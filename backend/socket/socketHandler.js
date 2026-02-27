@@ -14,7 +14,6 @@ const onlineUsers = new Map();
 const socketHandler = (io) => {
   // ================================
   // AUTHENTICATION MIDDLEWARE
-  // runs before every connection
   // ================================
   io.use(async (socket, next) => {
     try {
@@ -53,19 +52,17 @@ const socketHandler = (io) => {
     // ================================
     onlineUsers.set(userId, socket.id);
 
-    // Update DB
     await User.findByIdAndUpdate(userId, {
       isOnline: true,
       lastSeen: new Date(),
     });
 
-    // Notify contacts that user is online
+    // Notify contacts user is online
     socket.broadcast.emit("userOnline", { userId });
 
     // Mark pending messages as delivered
     const delivered = await Message.markAsDelivered(userId);
     if (delivered.modifiedCount > 0) {
-      // Notify senders their messages were delivered
       notifyDelivered(io, onlineUsers, userId);
     }
 
@@ -99,7 +96,6 @@ const socketHandler = (io) => {
           return callback?.({ success: false, message: "text or mediaUrl required." });
         }
 
-        // Verify chat
         const chat = await Chat.findOne({
           _id: chatId,
           participants: { $all: [userId, receiverId] },
@@ -109,7 +105,6 @@ const socketHandler = (io) => {
           return callback?.({ success: false, message: "Chat not found." });
         }
 
-        // Create message
         const message = await Message.create({
           chatId,
           sender: userId,
@@ -128,52 +123,37 @@ const socketHandler = (io) => {
           await message.populate("replyTo", "text mediaUrl messageType sender");
         }
 
-        // Update chat
         chat.lastMessage = message._id;
         chat.updatedAt = new Date();
         chat.deletedFor = [];
         await chat.save();
 
-        // Increment unread for receiver
         await chat.incrementUnread(receiverId);
 
-        // Emit to sender — confirmation
+        // Confirm to sender
         callback?.({ success: true, message });
 
-        // Check if receiver is online
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
-          // Receiver is online — send instantly
-          io.to(receiverSocketId).emit("receiveMessage", {
-            message,
-            chatId,
-          });
+          io.to(receiverSocketId).emit("receiveMessage", { message, chatId });
 
-          // Update message status to delivered
           message.status = "delivered";
           message.deliveredAt = new Date();
           await message.save();
 
-          // Notify sender of delivery
           socket.emit("messageDelivered", {
             messageId: message._id,
             chatId,
           });
         } else {
-          // Receiver is offline — send push notification
-          const receiver = await User.findById(receiverId).select(
-            "fcmToken name"
-          );
-
+          // Receiver offline — push notification
+          const receiver = await User.findById(receiverId).select("fcmToken name");
           if (receiver?.fcmToken) {
             await sendPushNotification({
               fcmToken: receiver.fcmToken,
               title: socket.user.name || "New Message",
-              body:
-                messageType === "text"
-                  ? text
-                  : `Sent a ${messageType}`,
+              body: messageType === "text" ? text : `Sent a ${messageType}`,
               data: {
                 type: "message",
                 chatId,
@@ -196,14 +176,11 @@ const socketHandler = (io) => {
       try {
         const { chatId, senderId } = data;
 
-        // Mark all messages in chat as seen
         await Message.markAsSeen(chatId, userId);
 
-        // Reset unread count
         const chat = await Chat.findById(chatId);
         if (chat) await chat.resetUnread(userId);
 
-        // Notify sender that messages were seen
         const senderSocketId = onlineUsers.get(senderId);
         if (senderSocketId) {
           io.to(senderSocketId).emit("messagesSeen", {
@@ -246,7 +223,6 @@ const socketHandler = (io) => {
 
     // ================================
     // MESSAGE DELETED
-    // notify other user in real time
     // ================================
     socket.on("messageDeleted", (data) => {
       const { chatId, messageId, receiverId, deleteFor } = data;
@@ -294,15 +270,18 @@ const socketHandler = (io) => {
 
     // ================================
     // VOICE / VIDEO CALL — INITIATE
+    // FIX: Pass the SDP offer WITH the call invite so the receiver has it
+    //      immediately when they accept. Previously offer was sent separately
+    //      via sendOffer AFTER callUser, causing a race condition where the
+    //      receiver's peer connection was set up before the offer arrived.
     // ================================
     socket.on("callUser", async (data) => {
       try {
-        const { receiverId, callType, roomId, callId } = data;
+        const { receiverId, callType, roomId, callId, offer } = data;
 
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
-          // Receiver is online — ring them
           io.to(receiverSocketId).emit("incomingCall", {
             callerId: userId,
             caller: {
@@ -314,9 +293,10 @@ const socketHandler = (io) => {
             callType,
             roomId,
             callId,
+            offer, // FIX: include SDP offer so receiver can process it on accept
           });
         } else {
-          // Receiver offline — send push notification
+          // Receiver offline — push notification
           const receiver = await User.findById(receiverId).select("fcmToken name");
 
           if (receiver?.fcmToken) {
@@ -334,14 +314,10 @@ const socketHandler = (io) => {
             });
           }
 
-          // Update call status to missed
           if (callId) {
-            await CallLog.findByIdAndUpdate(callId, {
-              callStatus: "missed",
-            });
+            await CallLog.findByIdAndUpdate(callId, { callStatus: "missed" });
           }
 
-          // Notify caller receiver is offline
           socket.emit("callUserOffline", { receiverId });
         }
       } catch (error) {
@@ -357,7 +333,6 @@ const socketHandler = (io) => {
         const { callerId, roomId, callId } = data;
 
         const callerSocketId = onlineUsers.get(callerId);
-
         if (callerSocketId) {
           io.to(callerSocketId).emit("callAccepted", {
             acceptedBy: userId,
@@ -366,7 +341,6 @@ const socketHandler = (io) => {
           });
         }
 
-        // Update call log
         if (callId) {
           await CallLog.findByIdAndUpdate(callId, {
             callStatus: "completed",
@@ -393,11 +367,8 @@ const socketHandler = (io) => {
           });
         }
 
-        // Update call log
         if (callId) {
-          await CallLog.findByIdAndUpdate(callId, {
-            callStatus: "rejected",
-          });
+          await CallLog.findByIdAndUpdate(callId, { callStatus: "rejected" });
         }
       } catch (error) {
         console.error("rejectCall socket error:", error.message);
@@ -406,7 +377,6 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL CANCELLED
-    // (caller cancels before answer)
     // ================================
     socket.on("cancelCall", async (data) => {
       try {
@@ -421,9 +391,7 @@ const socketHandler = (io) => {
         }
 
         if (callId) {
-          await CallLog.findByIdAndUpdate(callId, {
-            callStatus: "cancelled",
-          });
+          await CallLog.findByIdAndUpdate(callId, { callStatus: "cancelled" });
         }
       } catch (error) {
         console.error("cancelCall socket error:", error.message);
@@ -432,6 +400,8 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL ENDED
+    // FIX: Added missing await callLog.save() — duration was being
+    //      calculated but never persisted to the database.
     // ================================
     socket.on("endCall", async (data) => {
       try {
@@ -445,13 +415,13 @@ const socketHandler = (io) => {
           });
         }
 
-        // Calculate duration
         if (callId) {
           const callLog = await CallLog.findById(callId);
           if (callLog) {
             callLog.endedAt = new Date();
             if (!callLog.startedAt) callLog.startedAt = callLog.initiatedAt;
             await callLog.calculateDuration();
+            await callLog.save(); // FIX: was missing — duration never saved
           }
         }
       } catch (error) {
@@ -461,6 +431,8 @@ const socketHandler = (io) => {
 
     // ================================
     // WEBRTC SIGNALING — OFFER
+    // This is now a fallback. Ideally the offer travels with callUser above.
+    // Keeping this so ICE restart offers still work during an active call.
     // ================================
     socket.on("sendOffer", (data) => {
       const { receiverId, offer, roomId } = data;
@@ -505,7 +477,7 @@ const socketHandler = (io) => {
     });
 
     // ================================
-    // STATUS VIEWED — REAL TIME
+    // STATUS VIEWED
     // ================================
     socket.on("statusViewed", (data) => {
       const { statusOwnerId, statusId } = data;
@@ -520,16 +492,14 @@ const socketHandler = (io) => {
     });
 
     // ================================
-    // GET ONLINE STATUS OF USER
+    // CHECK ONLINE STATUS
     // ================================
     socket.on("checkOnlineStatus", (data) => {
       const { userIds } = data;
       const onlineStatuses = {};
-
       userIds.forEach((id) => {
         onlineStatuses[id] = onlineUsers.has(id);
       });
-
       socket.emit("onlineStatuses", onlineStatuses);
     });
 
@@ -543,25 +513,18 @@ const socketHandler = (io) => {
 
       const lastSeen = new Date();
 
-      // Update DB
       await User.findByIdAndUpdate(userId, {
         isOnline: false,
         lastSeen,
       });
 
-      // Notify contacts user went offline
-      socket.broadcast.emit("userOffline", {
-        userId,
-        lastSeen,
-      });
+      socket.broadcast.emit("userOffline", { userId, lastSeen });
     });
   });
 };
 
 // ================================
 // HELPER — NOTIFY DELIVERED
-// tells senders their messages
-// were delivered when user connects
 // ================================
 const notifyDelivered = async (io, onlineUsers, receiverId) => {
   try {
