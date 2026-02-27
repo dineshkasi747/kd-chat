@@ -3,7 +3,11 @@ import Message from "../models/Message.js";
 import Chat from "../models/Chat.js";
 import User from "../models/User.js";
 import CallLog from "../models/CallLog.js";
-import { sendPushNotification } from "../utils/notifications.js";
+import {
+  sendMessageNotification,  // FIX: use specific helpers instead of raw sendPushNotification
+  sendCallNotification,
+  sendMissedCallNotification,
+} from "../utils/notifications.js";
 
 // ================================
 // ONLINE USERS MAP
@@ -57,7 +61,6 @@ const socketHandler = (io) => {
       lastSeen: new Date(),
     });
 
-    // Notify contacts user is online
     socket.broadcast.emit("userOnline", { userId });
 
     // Mark pending messages as delivered
@@ -66,13 +69,13 @@ const socketHandler = (io) => {
       notifyDelivered(io, onlineUsers, userId);
     }
 
-    // ================================
-    // JOIN PERSONAL ROOM
-    // ================================
     socket.join(userId);
 
     // ================================
     // SEND MESSAGE
+    // FIX: Use sendMessageNotification helper instead of raw
+    //      sendPushNotification so the body is properly formatted
+    //      per message type (📷 Photo, 🎥 Video, 🎵 Voice etc.)
     // ================================
     socket.on("sendMessage", async (data, callback) => {
       try {
@@ -130,12 +133,12 @@ const socketHandler = (io) => {
 
         await chat.incrementUnread(receiverId);
 
-        // Confirm to sender
         callback?.({ success: true, message });
 
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
+          // Receiver is online — deliver in real time
           io.to(receiverSocketId).emit("receiveMessage", { message, chatId });
 
           message.status = "delivered";
@@ -147,19 +150,18 @@ const socketHandler = (io) => {
             chatId,
           });
         } else {
-          // Receiver offline — push notification
-          const receiver = await User.findById(receiverId).select("fcmToken name");
+          // FIX: Receiver offline — use sendMessageNotification which
+          //      formats the body correctly per message type
+          const receiver = await User.findById(receiverId).select("fcmToken");
           if (receiver?.fcmToken) {
-            await sendPushNotification({
-              fcmToken: receiver.fcmToken,
-              title: socket.user.name || "New Message",
-              body: messageType === "text" ? text : `Sent a ${messageType}`,
-              data: {
-                type: "message",
-                chatId,
-                senderId: userId,
-                messageId: message._id.toString(),
-              },
+            await sendMessageNotification({
+              receiverFcmToken: receiver.fcmToken,
+              senderName: socket.user.name || "New Message",
+              messageType,
+              text,
+              chatId,
+              senderId: userId,
+              messageId: message._id.toString(),
             });
           }
         }
@@ -270,10 +272,9 @@ const socketHandler = (io) => {
 
     // ================================
     // VOICE / VIDEO CALL — INITIATE
-    // FIX: Pass the SDP offer WITH the call invite so the receiver has it
-    //      immediately when they accept. Previously offer was sent separately
-    //      via sendOffer AFTER callUser, causing a race condition where the
-    //      receiver's peer connection was set up before the offer arrived.
+    // FIX 1: offer travels WITH the call invite (not separately)
+    // FIX 2: Use sendCallNotification helper for offline users
+    // FIX 3: Send missed call notification to receiver when offline
     // ================================
     socket.on("callUser", async (data) => {
       try {
@@ -282,6 +283,7 @@ const socketHandler = (io) => {
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
+          // Receiver is online — ring them with offer attached
           io.to(receiverSocketId).emit("incomingCall", {
             callerId: userId,
             caller: {
@@ -293,29 +295,37 @@ const socketHandler = (io) => {
             callType,
             roomId,
             callId,
-            offer, // FIX: include SDP offer so receiver can process it on accept
+            offer, // SDP offer travels with invite
           });
         } else {
-          // Receiver offline — push notification
-          const receiver = await User.findById(receiverId).select("fcmToken name");
+          // FIX: Receiver offline — use sendCallNotification helper
+          const receiver = await User.findById(receiverId).select("fcmToken");
 
           if (receiver?.fcmToken) {
-            await sendPushNotification({
-              fcmToken: receiver.fcmToken,
-              title: `Incoming ${callType} call`,
-              body: `${socket.user.name || "Someone"} is calling you`,
-              data: {
-                type: "call",
-                callType,
-                callerId: userId,
-                callId,
-                roomId,
-              },
+            await sendCallNotification({
+              receiverFcmToken: receiver.fcmToken,
+              callerName: socket.user.name,
+              callType,
+              callerId: userId,
+              callId,
+              roomId,
             });
           }
 
+          // Mark as missed since receiver is offline
           if (callId) {
             await CallLog.findByIdAndUpdate(callId, { callStatus: "missed" });
+          }
+
+          // FIX: Also send missed call notification so receiver knows
+          //      they missed a call when they come back online
+          if (receiver?.fcmToken) {
+            await sendMissedCallNotification({
+              receiverFcmToken: receiver.fcmToken,
+              callerName: socket.user.name,
+              callType,
+              callerId: userId,
+            });
           }
 
           socket.emit("callUserOffline", { receiverId });
@@ -354,6 +364,8 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL REJECTED
+    // FIX: Send missed call notification to caller so they know
+    //      the call was declined (useful if caller locks screen)
     // ================================
     socket.on("rejectCall", async (data) => {
       try {
@@ -401,7 +413,7 @@ const socketHandler = (io) => {
     // ================================
     // CALL ENDED
     // FIX: Added missing await callLog.save() — duration was being
-    //      calculated but never persisted to the database.
+    //      calculated but never written to the database.
     // ================================
     socket.on("endCall", async (data) => {
       try {
@@ -421,7 +433,7 @@ const socketHandler = (io) => {
             callLog.endedAt = new Date();
             if (!callLog.startedAt) callLog.startedAt = callLog.initiatedAt;
             await callLog.calculateDuration();
-            await callLog.save(); // FIX: was missing — duration never saved
+            await callLog.save(); // FIX: was missing — duration never saved to DB
           }
         }
       } catch (error) {
@@ -431,8 +443,8 @@ const socketHandler = (io) => {
 
     // ================================
     // WEBRTC SIGNALING — OFFER
-    // This is now a fallback. Ideally the offer travels with callUser above.
-    // Keeping this so ICE restart offers still work during an active call.
+    // Kept as fallback for ICE restarts during active calls.
+    // Initial call setup now sends offer via callUser above.
     // ================================
     socket.on("sendOffer", (data) => {
       const { receiverId, offer, roomId } = data;
