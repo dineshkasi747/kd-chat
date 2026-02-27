@@ -31,6 +31,12 @@ const app = express();
 const server = createServer(app);
 
 // ================================
+// FIX: TRUST PROXY — Required for Render/Heroku/Railway
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// ================================
+app.set("trust proxy", 1);
+
+// ================================
 // SOCKET.IO SETUP
 // ================================
 const io = new Server(server, {
@@ -52,6 +58,9 @@ app.use(compression());
 const limiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: parseInt(process.env.RATE_LIMIT_MAX) || 100,
+  // FIX: use standardHeaders + skip trust proxy validation error
+  standardHeaders: true,
+  legacyHeaders: false,
   message: {
     success: false,
     message: "Too many requests, please try again later.",
@@ -76,7 +85,7 @@ if (process.env.NODE_ENV === "development") {
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "WhatsApp Clone API is running 🚀",
+    message: "KD Chat API is running 🚀",
     version: "1.0.0",
     environment: process.env.NODE_ENV,
   });

@@ -13,7 +13,6 @@ export const getChats = async (req, res) => {
 
     const chats = await Chat.getUserChats(userId);
 
-    // Format chats — hide other participant's info based on block
     const formattedChats = chats.map((chat) => {
       const otherParticipant = chat.participants.find(
         (p) => p._id.toString() !== userId.toString()
@@ -58,43 +57,66 @@ export const getChats = async (req, res) => {
 // ================================
 // GET OR CREATE CHAT
 // POST /api/chats
+// FIX: Added detailed logging + isActive check was rejecting valid users
 // ================================
 export const getOrCreateChat = async (req, res) => {
   try {
     const currentUserId = req.user._id;
     const { userId } = req.body;
 
+    // ── Log exactly what we received ──────────────
+    console.log(`[getOrCreateChat] currentUser=${currentUserId} targetUserId=${userId}`);
+
     if (!userId) {
+      console.log("[getOrCreateChat] ERROR: userId missing from request body");
       return res.status(400).json({
         success: false,
         message: "userId is required.",
       });
     }
 
-    if (currentUserId.toString() === userId) {
+    if (currentUserId.toString() === userId.toString()) {
       return res.status(400).json({
         success: false,
         message: "Cannot create chat with yourself.",
       });
     }
 
-    // Check if other user exists
+    // ── Find other user ────────────────────────────
+    // FIX: removed isActive check — was causing 404 for valid users
+    // whose isActive flag wasn't set during registration
     const otherUser = await User.findById(userId).select(
-      "name phoneNumber profilePic isOnline lastSeen about"
+      "name phoneNumber profilePic isOnline lastSeen about isActive"
     );
 
-    if (!otherUser || !otherUser.isActive) {
+    console.log(`[getOrCreateChat] otherUser found:`, otherUser ? {
+      id: otherUser._id,
+      name: otherUser.name,
+      phone: otherUser.phoneNumber,
+      isActive: otherUser.isActive,
+    } : "NOT FOUND");
+
+    if (!otherUser) {
       return res.status(404).json({
         success: false,
         message: "User not found.",
       });
     }
 
-    // Check if chat already exists
+    // FIX: Only block if isActive is explicitly false (not undefined/null)
+    // New users might not have isActive set yet
+    if (otherUser.isActive === false) {
+      return res.status(404).json({
+        success: false,
+        message: "User account is deactivated.",
+      });
+    }
+
+    // ── Find or create chat ────────────────────────
     let chat = await Chat.findBetween(currentUserId, userId);
+    console.log(`[getOrCreateChat] existing chat:`, chat ? chat._id : "none — will create");
 
     if (!chat) {
-      // Create new chat
       chat = await Chat.create({
         participants: [currentUserId, userId],
         unreadCount: [
@@ -102,15 +124,18 @@ export const getOrCreateChat = async (req, res) => {
           { user: userId, count: 0 },
         ],
       });
+      console.log(`[getOrCreateChat] Created new chat: ${chat._id}`);
     }
 
-    // Remove from deletedFor if it was deleted
-    if (chat.deletedFor.includes(currentUserId)) {
+    // Remove from deletedFor if previously deleted
+    if (chat.deletedFor.some((id) => id.toString() === currentUserId.toString())) {
       chat.deletedFor = chat.deletedFor.filter(
         (id) => id.toString() !== currentUserId.toString()
       );
       await chat.save();
     }
+
+    console.log(`[getOrCreateChat] SUCCESS chatId=${chat._id}`);
 
     return res.status(200).json({
       success: true,
@@ -118,7 +143,12 @@ export const getOrCreateChat = async (req, res) => {
         _id: chat._id,
         participant: otherUser,
         lastMessage: chat.lastMessage,
+        unreadCount: 0,
+        isPinned: false,
+        isArchived: false,
+        isMuted: false,
         createdAt: chat.createdAt,
+        updatedAt: chat.updatedAt,
       },
     });
   } catch (error) {
@@ -141,7 +171,6 @@ export const getMessages = async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
 
-    // Verify user is part of chat
     const chat = await Chat.findOne({
       _id: chatId,
       participants: userId,
@@ -156,7 +185,6 @@ export const getMessages = async (req, res) => {
 
     const messages = await Message.getChatMessages(chatId, userId, page, limit);
 
-    // Mark messages as seen
     await Message.markAsSeen(chatId, userId);
     await chat.resetUnread(userId);
 
@@ -164,7 +192,7 @@ export const getMessages = async (req, res) => {
       success: true,
       page,
       count: messages.length,
-      messages: messages.reverse(), // oldest first
+      messages: messages.reverse(),
     });
   } catch (error) {
     console.error("Get messages error:", error.message);
@@ -199,7 +227,6 @@ export const sendMessage = async (req, res) => {
       });
     }
 
-    // Verify chat exists and user is participant
     const chat = await Chat.findOne({
       _id: chatId,
       participants: { $all: [senderId, receiverId] },
@@ -212,7 +239,6 @@ export const sendMessage = async (req, res) => {
       });
     }
 
-    // Create message
     const message = await Message.create({
       chatId,
       sender: senderId,
@@ -228,16 +254,11 @@ export const sendMessage = async (req, res) => {
       await message.populate("replyTo", "text mediaUrl messageType sender");
     }
 
-    // Update chat last message
     chat.lastMessage = message._id;
     chat.updatedAt = new Date();
-
-    // Remove from deletedFor for both users
     chat.deletedFor = [];
-
     await chat.save();
 
-    // Increment unread for receiver
     await chat.incrementUnread(receiverId);
 
     return res.status(201).json({
@@ -297,7 +318,6 @@ export const sendMediaMessage = async (req, res) => {
 
     await message.populate("sender", "name profilePic");
 
-    // Update chat
     chat.lastMessage = message._id;
     chat.updatedAt = new Date();
     chat.deletedFor = [];
@@ -325,7 +345,7 @@ export const sendMediaMessage = async (req, res) => {
 export const deleteMessage = async (req, res) => {
   try {
     const { messageId } = req.params;
-    const { deleteFor } = req.body; // "me" or "everyone"
+    const { deleteFor } = req.body;
     const userId = req.user._id;
 
     const message = await Message.findById(messageId);
@@ -337,7 +357,6 @@ export const deleteMessage = async (req, res) => {
       });
     }
 
-    // Only sender can delete for everyone
     if (
       deleteFor === "everyone" &&
       message.sender.toString() !== userId.toString()
@@ -349,17 +368,14 @@ export const deleteMessage = async (req, res) => {
     }
 
     if (deleteFor === "everyone") {
-      // Delete media from cloudinary if exists
       if (message.mediaPublicId) {
         await deleteFromCloudinary(message.mediaPublicId, message.messageType);
       }
-
       message.isDeletedForEveryone = true;
       message.text = "";
       message.mediaUrl = "";
       await message.save();
     } else {
-      // Delete for me only
       message.deletedFor.push(userId);
       await message.save();
     }
@@ -389,19 +405,13 @@ export const editMessage = async (req, res) => {
     const userId = req.user._id;
 
     if (!text || text.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Text is required.",
-      });
+      return res.status(400).json({ success: false, message: "Text is required." });
     }
 
     const message = await Message.findById(messageId);
 
     if (!message) {
-      return res.status(404).json({
-        success: false,
-        message: "Message not found.",
-      });
+      return res.status(404).json({ success: false, message: "Message not found." });
     }
 
     if (message.sender.toString() !== userId.toString()) {
@@ -423,16 +433,10 @@ export const editMessage = async (req, res) => {
     message.editedAt = new Date();
     await message.save();
 
-    return res.status(200).json({
-      success: true,
-      message,
-    });
+    return res.status(200).json({ success: true, message });
   } catch (error) {
     console.error("Edit message error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error editing message.",
-    });
+    return res.status(500).json({ success: false, message: "Server error editing message." });
   }
 };
 
@@ -446,15 +450,13 @@ export const toggleStarMessage = async (req, res) => {
     const userId = req.user._id;
 
     const message = await Message.findById(messageId);
-
     if (!message) {
-      return res.status(404).json({
-        success: false,
-        message: "Message not found.",
-      });
+      return res.status(404).json({ success: false, message: "Message not found." });
     }
 
-    const isStarred = message.starredBy.includes(userId);
+    const isStarred = message.starredBy.some(
+      (id) => id.toString() === userId.toString()
+    );
 
     if (isStarred) {
       message.starredBy = message.starredBy.filter(
@@ -473,15 +475,12 @@ export const toggleStarMessage = async (req, res) => {
     });
   } catch (error) {
     console.error("Star message error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error starring message.",
-    });
+    return res.status(500).json({ success: false, message: "Server error starring message." });
   }
 };
 
 // ================================
-// ADD REACTION TO MESSAGE
+// ADD REACTION
 // POST /api/chats/messages/:messageId/reaction
 // ================================
 export const addReaction = async (req, res) => {
@@ -491,27 +490,17 @@ export const addReaction = async (req, res) => {
     const userId = req.user._id;
 
     if (!emoji) {
-      return res.status(400).json({
-        success: false,
-        message: "Emoji is required.",
-      });
+      return res.status(400).json({ success: false, message: "Emoji is required." });
     }
 
     const message = await Message.findById(messageId);
-
     if (!message) {
-      return res.status(404).json({
-        success: false,
-        message: "Message not found.",
-      });
+      return res.status(404).json({ success: false, message: "Message not found." });
     }
 
-    // Remove existing reaction from this user
     message.reactions = message.reactions.filter(
       (r) => r.user.toString() !== userId.toString()
     );
-
-    // Add new reaction
     message.reactions.push({ user: userId, emoji });
     await message.save();
 
@@ -522,10 +511,7 @@ export const addReaction = async (req, res) => {
     });
   } catch (error) {
     console.error("Add reaction error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error adding reaction.",
-    });
+    return res.status(500).json({ success: false, message: "Server error adding reaction." });
   }
 };
 
@@ -538,39 +524,22 @@ export const clearChat = async (req, res) => {
     const { chatId } = req.params;
     const userId = req.user._id;
 
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId,
-    });
-
+    const chat = await Chat.findOne({ _id: chatId, participants: userId });
     if (!chat) {
-      return res.status(404).json({
-        success: false,
-        message: "Chat not found.",
-      });
+      return res.status(404).json({ success: false, message: "Chat not found." });
     }
 
-    // Add userId to deletedFor on all messages
-    await Message.updateMany(
-      { chatId },
-      { $addToSet: { deletedFor: userId } }
-    );
+    await Message.updateMany({ chatId }, { $addToSet: { deletedFor: userId } });
 
-    return res.status(200).json({
-      success: true,
-      message: "Chat cleared successfully.",
-    });
+    return res.status(200).json({ success: true, message: "Chat cleared successfully." });
   } catch (error) {
     console.error("Clear chat error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error clearing chat.",
-    });
+    return res.status(500).json({ success: false, message: "Server error clearing chat." });
   }
 };
 
 // ================================
-// ARCHIVE / UNARCHIVE CHAT
+// ARCHIVE / UNARCHIVE
 // PUT /api/chats/:chatId/archive
 // ================================
 export const toggleArchiveChat = async (req, res) => {
@@ -578,16 +547,9 @@ export const toggleArchiveChat = async (req, res) => {
     const { chatId } = req.params;
     const userId = req.user._id;
 
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId,
-    });
-
+    const chat = await Chat.findOne({ _id: chatId, participants: userId });
     if (!chat) {
-      return res.status(404).json({
-        success: false,
-        message: "Chat not found.",
-      });
+      return res.status(404).json({ success: false, message: "Chat not found." });
     }
 
     const isArchived = chat.archivedBy.some(
@@ -611,15 +573,12 @@ export const toggleArchiveChat = async (req, res) => {
     });
   } catch (error) {
     console.error("Archive chat error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error archiving chat.",
-    });
+    return res.status(500).json({ success: false, message: "Server error archiving chat." });
   }
 };
 
 // ================================
-// PIN / UNPIN CHAT
+// PIN / UNPIN
 // PUT /api/chats/:chatId/pin
 // ================================
 export const togglePinChat = async (req, res) => {
@@ -627,19 +586,11 @@ export const togglePinChat = async (req, res) => {
     const { chatId } = req.params;
     const userId = req.user._id;
 
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId,
-    });
-
+    const chat = await Chat.findOne({ _id: chatId, participants: userId });
     if (!chat) {
-      return res.status(404).json({
-        success: false,
-        message: "Chat not found.",
-      });
+      return res.status(404).json({ success: false, message: "Chat not found." });
     }
 
-    // Max 3 pinned chats like WhatsApp
     const userPinnedChats = await Chat.countDocuments({
       participants: userId,
       pinnedBy: userId,
@@ -673,33 +624,23 @@ export const togglePinChat = async (req, res) => {
     });
   } catch (error) {
     console.error("Pin chat error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error pinning chat.",
-    });
+    return res.status(500).json({ success: false, message: "Server error pinning chat." });
   }
 };
 
 // ================================
-// MUTE / UNMUTE CHAT
+// MUTE / UNMUTE
 // PUT /api/chats/:chatId/mute
 // ================================
 export const toggleMuteChat = async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { muteDuration } = req.body; // in hours: 8, 168 (1 week), 0 (forever)
+    const { muteDuration } = req.body;
     const userId = req.user._id;
 
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId,
-    });
-
+    const chat = await Chat.findOne({ _id: chatId, participants: userId });
     if (!chat) {
-      return res.status(404).json({
-        success: false,
-        message: "Chat not found.",
-      });
+      return res.status(404).json({ success: false, message: "Chat not found." });
     }
 
     const muteIndex = chat.mutedBy.findIndex(
@@ -707,17 +648,11 @@ export const toggleMuteChat = async (req, res) => {
     );
 
     if (muteIndex > -1) {
-      // Already muted — unmute
       chat.mutedBy.splice(muteIndex, 1);
       await chat.save();
-      return res.status(200).json({
-        success: true,
-        isMuted: false,
-        message: "Chat unmuted.",
-      });
+      return res.status(200).json({ success: true, isMuted: false, message: "Chat unmuted." });
     }
 
-    // Mute with duration
     const mutedUntil =
       muteDuration > 0
         ? new Date(Date.now() + muteDuration * 60 * 60 * 1000)
@@ -734,10 +669,7 @@ export const toggleMuteChat = async (req, res) => {
     });
   } catch (error) {
     console.error("Mute chat error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "Server error muting chat.",
-    });
+    return res.status(500).json({ success: false, message: "Server error muting chat." });
   }
 };
 
