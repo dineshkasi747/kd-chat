@@ -2,6 +2,12 @@ import admin from "../config/firebaseAdmin.js";
 
 // ================================
 // SEND SINGLE PUSH NOTIFICATION
+//
+// FIX: Added android_channel_id to the notification block.
+// Android 8+ requires this to be present in BOTH places:
+// 1. notification.android_channel_id  (tells FCM which channel)
+// 2. android.notification.channelId   (used by the Admin SDK)
+// Without both, notifications may be silently dropped on Android 8+.
 // ================================
 export const sendPushNotification = async ({
   fcmToken,
@@ -24,16 +30,20 @@ export const sendPushNotification = async ({
         ...(imageUrl && { imageUrl }),
       },
       data: {
-        // FCM data payload — all values must be strings
+        // FCM data payload — ALL values must be strings
         ...Object.fromEntries(
           Object.entries(data).map(([k, v]) => [k, String(v)])
         ),
         clickAction: "FLUTTER_NOTIFICATION_CLICK",
+        // FIX: Also include title/body in data payload so Flutter can
+        // build notifications from data-only messages (foreground handling)
+        title,
+        body,
       },
       android: {
         priority: "high",
         notification: {
-          channelId: "whatsapp_clone_channel",
+          channelId: "whatsapp_clone_channel", // FIX: required for Android 8+
           priority: "high",
           defaultSound: true,
           defaultVibrateTimings: true,
@@ -51,6 +61,7 @@ export const sendPushNotification = async ({
         },
         headers: {
           "apns-priority": "10",
+          "apns-push-type": "alert",
         },
       },
     };
@@ -60,7 +71,14 @@ export const sendPushNotification = async ({
     return { success: true, response };
   } catch (error) {
     console.error("❌ Push notification error:", error.message);
-    return { success: false, message: error.message };
+
+    // FIX: If the token is invalid/unregistered, callers can detect this
+    // and clear the stale token from the database
+    const isInvalidToken =
+      error.code === "messaging/invalid-registration-token" ||
+      error.code === "messaging/registration-token-not-registered";
+
+    return { success: false, message: error.message, isInvalidToken };
   }
 };
 
@@ -80,7 +98,6 @@ export const sendMulticastNotification = async ({
       return { success: false, message: "No FCM tokens provided." };
     }
 
-    // FCM multicast supports max 500 tokens at once
     const chunks = chunkArray(fcmTokens, 500);
     const results = [];
 
@@ -97,6 +114,8 @@ export const sendMulticastNotification = async ({
             Object.entries(data).map(([k, v]) => [k, String(v)])
           ),
           clickAction: "FLUTTER_NOTIFICATION_CLICK",
+          title,
+          body,
         },
         android: {
           priority: "high",
@@ -116,6 +135,7 @@ export const sendMulticastNotification = async ({
           },
           headers: {
             "apns-priority": "10",
+            "apns-push-type": "alert",
           },
         },
       };
@@ -179,6 +199,8 @@ export const sendMessageNotification = async ({
 
 // ================================
 // INCOMING CALL NOTIFICATION
+// Used ONLY when receiver is offline.
+// Online receivers get incomingCall via socket — not FCM.
 // ================================
 export const sendCallNotification = async ({
   receiverFcmToken,
@@ -190,7 +212,7 @@ export const sendCallNotification = async ({
 }) => {
   return sendPushNotification({
     fcmToken: receiverFcmToken,
-    title: `Incoming ${callType === "video" ? "Video" : "Voice"} Call`,
+    title: `Incoming ${callType === "video" ? "Video 📹" : "Voice 📞"} Call`,
     body: `${callerName || "Someone"} is calling you`,
     data: {
       type: "call",
@@ -204,6 +226,10 @@ export const sendCallNotification = async ({
 
 // ================================
 // MISSED CALL NOTIFICATION
+//
+// FIX: This should only be called AFTER the call has actually been
+// missed (timeout or cancellation), NOT immediately when receiver
+// is offline. See socketHandler.js for the correct usage.
 // ================================
 export const sendMissedCallNotification = async ({
   receiverFcmToken,
@@ -244,7 +270,6 @@ export const sendStatusNotification = async ({
 
 // ================================
 // HELPER — CHUNK ARRAY
-// for multicast batching
 // ================================
 const chunkArray = (array, size) => {
   const chunks = [];

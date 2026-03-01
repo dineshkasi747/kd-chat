@@ -4,7 +4,7 @@ import Chat from "../models/Chat.js";
 import User from "../models/User.js";
 import CallLog from "../models/CallLog.js";
 import {
-  sendMessageNotification,  // FIX: use specific helpers instead of raw sendPushNotification
+  sendMessageNotification,
   sendCallNotification,
   sendMissedCallNotification,
 } from "../utils/notifications.js";
@@ -14,6 +14,20 @@ import {
 // userId => socketId
 // ================================
 const onlineUsers = new Map();
+
+// ================================
+// HELPER — CLEAR STALE FCM TOKEN
+// Called when FCM tells us a token is no longer valid.
+// Prevents wasted sends and misleading delivery errors.
+// ================================
+const clearStaleFcmToken = async (userId) => {
+  try {
+    await User.findByIdAndUpdate(userId, { fcmToken: "" });
+    console.log(`🧹 Cleared stale FCM token for user: ${userId}`);
+  } catch (err) {
+    console.error("clearStaleFcmToken error:", err.message);
+  }
+};
 
 const socketHandler = (io) => {
   // ================================
@@ -25,15 +39,10 @@ const socketHandler = (io) => {
         socket.handshake.auth.token ||
         socket.handshake.headers.authorization?.split(" ")[1];
 
-      if (!token) {
-        return next(new Error("Authentication token missing."));
-      }
+      if (!token) return next(new Error("Authentication token missing."));
 
       const user = await verifySocketToken(token);
-
-      if (!user) {
-        return next(new Error("Invalid or expired token."));
-      }
+      if (!user) return next(new Error("Invalid or expired token."));
 
       socket.user = user;
       socket.userId = user._id.toString();
@@ -48,12 +57,8 @@ const socketHandler = (io) => {
   // ================================
   io.on("connection", async (socket) => {
     const userId = socket.userId;
-
     console.log(`✅ User connected: ${userId} | Socket: ${socket.id}`);
 
-    // ================================
-    // REGISTER USER AS ONLINE
-    // ================================
     onlineUsers.set(userId, socket.id);
 
     await User.findByIdAndUpdate(userId, {
@@ -73,9 +78,17 @@ const socketHandler = (io) => {
 
     // ================================
     // SEND MESSAGE
-    // FIX: Use sendMessageNotification helper instead of raw
-    //      sendPushNotification so the body is properly formatted
-    //      per message type (📷 Photo, 🎥 Video, 🎵 Voice etc.)
+    //
+    // FIX (BUG 2): FCM is now also sent when receiver's socket exists
+    // but they might have the app in background (socket connected but
+    // Android process suspended). We detect this by checking if the
+    // socket emit actually reaches the client — we do this by checking
+    // the message delivery status.
+    //
+    // Practical approach: always send FCM for offline, and let the
+    // Flutter app suppress the local notification if it's already
+    // showing the message via socket (foreground). This is the WhatsApp
+    // approach — FCM is the safety net, socket is the fast path.
     // ================================
     socket.on("sendMessage", async (data, callback) => {
       try {
@@ -92,11 +105,17 @@ const socketHandler = (io) => {
         } = data;
 
         if (!chatId || !receiverId) {
-          return callback?.({ success: false, message: "chatId and receiverId required." });
+          return callback?.({
+            success: false,
+            message: "chatId and receiverId required.",
+          });
         }
 
         if (!text && !mediaUrl) {
-          return callback?.({ success: false, message: "text or mediaUrl required." });
+          return callback?.({
+            success: false,
+            message: "text or mediaUrl required.",
+          });
         }
 
         const chat = await Chat.findOne({
@@ -138,7 +157,7 @@ const socketHandler = (io) => {
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
-          // Receiver is online — deliver in real time
+          // Receiver socket is connected — deliver in real time
           io.to(receiverSocketId).emit("receiveMessage", { message, chatId });
 
           message.status = "delivered";
@@ -149,12 +168,15 @@ const socketHandler = (io) => {
             messageId: message._id,
             chatId,
           });
-        } else {
-          // FIX: Receiver offline — use sendMessageNotification which
-          //      formats the body correctly per message type
-          const receiver = await User.findById(receiverId).select("fcmToken");
+
+          // FIX (BUG 2): Also send FCM as a safety net for background/doze.
+          // The Flutter app suppresses the notification banner if the chat
+          // is currently active (SocketClient._activeChatId check).
+          const receiver = await User.findById(receiverId).select(
+            "fcmToken _id"
+          );
           if (receiver?.fcmToken) {
-            await sendMessageNotification({
+            const result = await sendMessageNotification({
               receiverFcmToken: receiver.fcmToken,
               senderName: socket.user.name || "New Message",
               messageType,
@@ -163,6 +185,29 @@ const socketHandler = (io) => {
               senderId: userId,
               messageId: message._id.toString(),
             });
+            // Clean up stale token
+            if (result.isInvalidToken) {
+              await clearStaleFcmToken(receiverId);
+            }
+          }
+        } else {
+          // Receiver is fully offline — FCM only
+          const receiver = await User.findById(receiverId).select(
+            "fcmToken _id"
+          );
+          if (receiver?.fcmToken) {
+            const result = await sendMessageNotification({
+              receiverFcmToken: receiver.fcmToken,
+              senderName: socket.user.name || "New Message",
+              messageType,
+              text,
+              chatId,
+              senderId: userId,
+              messageId: message._id.toString(),
+            });
+            if (result.isInvalidToken) {
+              await clearStaleFcmToken(receiverId);
+            }
           }
         }
       } catch (error) {
@@ -272,9 +317,17 @@ const socketHandler = (io) => {
 
     // ================================
     // VOICE / VIDEO CALL — INITIATE
-    // FIX 1: offer travels WITH the call invite (not separately)
-    // FIX 2: Use sendCallNotification helper for offline users
-    // FIX 3: Send missed call notification to receiver when offline
+    //
+    // FIX (BUG 1): Removed duplicate notification bug.
+    // Old code sent BOTH sendCallNotification AND sendMissedCallNotification
+    // to offline users immediately — giving them two notifications at once
+    // ("Incoming call" + "Missed call") before they could even see the first.
+    //
+    // Correct flow:
+    //   - Receiver ONLINE  → incomingCall socket event (no FCM)
+    //   - Receiver OFFLINE → sendCallNotification FCM only
+    //   - Missed call FCM  → sent only when caller CANCELS via cancelCall,
+    //                        not immediately on offline detection
     // ================================
     socket.on("callUser", async (data) => {
       try {
@@ -283,7 +336,7 @@ const socketHandler = (io) => {
         const receiverSocketId = onlineUsers.get(receiverId);
 
         if (receiverSocketId) {
-          // Receiver is online — ring them with offer attached
+          // Receiver is ONLINE — ring via socket (no FCM needed)
           io.to(receiverSocketId).emit("incomingCall", {
             callerId: userId,
             caller: {
@@ -295,14 +348,18 @@ const socketHandler = (io) => {
             callType,
             roomId,
             callId,
-            offer, // SDP offer travels with invite
+            offer, // SDP offer bundled with invite
           });
         } else {
-          // FIX: Receiver offline — use sendCallNotification helper
-          const receiver = await User.findById(receiverId).select("fcmToken");
+          // Receiver is OFFLINE — send ONE FCM notification
+          // FIX: Do NOT send missed call notification here.
+          //      That is sent separately when the caller cancels.
+          const receiver = await User.findById(receiverId).select(
+            "fcmToken _id"
+          );
 
           if (receiver?.fcmToken) {
-            await sendCallNotification({
+            const result = await sendCallNotification({
               receiverFcmToken: receiver.fcmToken,
               callerName: socket.user.name,
               callType,
@@ -310,24 +367,19 @@ const socketHandler = (io) => {
               callId,
               roomId,
             });
+            if (result.isInvalidToken) {
+              await clearStaleFcmToken(receiverId);
+            }
           }
 
-          // Mark as missed since receiver is offline
+          // Mark call log as missed immediately (receiver was offline)
           if (callId) {
-            await CallLog.findByIdAndUpdate(callId, { callStatus: "missed" });
-          }
-
-          // FIX: Also send missed call notification so receiver knows
-          //      they missed a call when they come back online
-          if (receiver?.fcmToken) {
-            await sendMissedCallNotification({
-              receiverFcmToken: receiver.fcmToken,
-              callerName: socket.user.name,
-              callType,
-              callerId: userId,
+            await CallLog.findByIdAndUpdate(callId, {
+              callStatus: "missed",
             });
           }
 
+          // Tell caller that receiver is offline
           socket.emit("callUserOffline", { receiverId });
         }
       } catch (error) {
@@ -364,8 +416,6 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL REJECTED
-    // FIX: Send missed call notification to caller so they know
-    //      the call was declined (useful if caller locks screen)
     // ================================
     socket.on("rejectCall", async (data) => {
       try {
@@ -389,6 +439,10 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL CANCELLED
+    //
+    // FIX (BUG 1): This is the correct place to send the missed call
+    // notification. The caller cancelled → receiver truly missed the call.
+    // Send missed call FCM here, not in callUser.
     // ================================
     socket.on("cancelCall", async (data) => {
       try {
@@ -396,10 +450,28 @@ const socketHandler = (io) => {
 
         const receiverSocketId = onlineUsers.get(receiverId);
         if (receiverSocketId) {
+          // Receiver is online — notify via socket
           io.to(receiverSocketId).emit("callCancelled", {
             cancelledBy: userId,
             callId,
           });
+        } else {
+          // FIX: Receiver is offline — THIS is the correct time to send
+          // the missed call notification (caller gave up / cancelled).
+          const receiver = await User.findById(receiverId).select(
+            "fcmToken _id"
+          );
+          if (receiver?.fcmToken) {
+            const result = await sendMissedCallNotification({
+              receiverFcmToken: receiver.fcmToken,
+              callerName: socket.user.name,
+              callType: data.callType || "audio",
+              callerId: userId,
+            });
+            if (result.isInvalidToken) {
+              await clearStaleFcmToken(receiverId);
+            }
+          }
         }
 
         if (callId) {
@@ -412,8 +484,8 @@ const socketHandler = (io) => {
 
     // ================================
     // CALL ENDED
-    // FIX: Added missing await callLog.save() — duration was being
-    //      calculated but never written to the database.
+    // FIX: Added missing callLog.save() — duration was calculated
+    // but never persisted to the database.
     // ================================
     socket.on("endCall", async (data) => {
       try {
@@ -433,7 +505,7 @@ const socketHandler = (io) => {
             callLog.endedAt = new Date();
             if (!callLog.startedAt) callLog.startedAt = callLog.initiatedAt;
             await callLog.calculateDuration();
-            await callLog.save(); // FIX: was missing — duration never saved to DB
+            await callLog.save(); // FIX: was missing before
           }
         }
       } catch (error) {
@@ -442,9 +514,7 @@ const socketHandler = (io) => {
     });
 
     // ================================
-    // WEBRTC SIGNALING — OFFER
-    // Kept as fallback for ICE restarts during active calls.
-    // Initial call setup now sends offer via callUser above.
+    // WEBRTC — OFFER (ICE restart fallback)
     // ================================
     socket.on("sendOffer", (data) => {
       const { receiverId, offer, roomId } = data;
@@ -459,7 +529,7 @@ const socketHandler = (io) => {
     });
 
     // ================================
-    // WEBRTC SIGNALING — ANSWER
+    // WEBRTC — ANSWER
     // ================================
     socket.on("sendAnswer", (data) => {
       const { callerId, answer, roomId } = data;
@@ -474,7 +544,7 @@ const socketHandler = (io) => {
     });
 
     // ================================
-    // WEBRTC SIGNALING — ICE CANDIDATE
+    // WEBRTC — ICE CANDIDATE
     // ================================
     socket.on("sendIceCandidate", (data) => {
       const { targetUserId, candidate, roomId } = data;
@@ -520,16 +590,9 @@ const socketHandler = (io) => {
     // ================================
     socket.on("disconnect", async () => {
       console.log(`❌ User disconnected: ${userId}`);
-
       onlineUsers.delete(userId);
-
       const lastSeen = new Date();
-
-      await User.findByIdAndUpdate(userId, {
-        isOnline: false,
-        lastSeen,
-      });
-
+      await User.findByIdAndUpdate(userId, { isOnline: false, lastSeen });
       socket.broadcast.emit("userOffline", { userId, lastSeen });
     });
   });
