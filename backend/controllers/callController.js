@@ -32,9 +32,8 @@ export const initiateCall = async (req, res) => {
       });
     }
 
-    // Check receiver exists
     const receiver = await User.findById(receiverId).select(
-      "name profilePic isOnline fcmToken blockedUsers"
+      "name profilePic isOnline fcmToken blockedUsers isActive"
     );
 
     if (!receiver || !receiver.isActive) {
@@ -44,7 +43,6 @@ export const initiateCall = async (req, res) => {
       });
     }
 
-    // Check if blocked
     const isBlocked = receiver.blockedUsers.some(
       (id) => id.toString() === callerId.toString()
     );
@@ -56,15 +54,13 @@ export const initiateCall = async (req, res) => {
       });
     }
 
-    // Generate unique room ID for WebRTC
     const roomId = uuidv4();
 
-    // Create call log
     const callLog = await CallLog.create({
       caller: callerId,
       receiver: receiverId,
       callType,
-      callStatus: "missed", // default — updated when accepted/rejected
+      callStatus: "missed",
       roomId,
       initiatedAt: new Date(),
     });
@@ -98,13 +94,8 @@ export const updateCallStatus = async (req, res) => {
     const userId = req.user._id;
 
     const validStatuses = [
-      "missed",
-      "completed",
-      "rejected",
-      "cancelled",
-      "no_answer",
-      "busy",
-      "failed",
+      "missed", "completed", "rejected", "cancelled",
+      "no_answer", "busy", "failed",
     ];
 
     if (!validStatuses.includes(callStatus)) {
@@ -123,25 +114,16 @@ export const updateCallStatus = async (req, res) => {
       });
     }
 
-    // Only caller or receiver can update
     const isParticipant =
       callLog.caller.toString() === userId.toString() ||
       callLog.receiver.toString() === userId.toString();
 
     if (!isParticipant) {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized.",
-      });
+      return res.status(403).json({ success: false, message: "Not authorized." });
     }
 
     callLog.callStatus = callStatus;
-
-    if (networkType) {
-      callLog.networkType = networkType;
-    }
-
-    // Set startedAt when call is accepted
+    if (networkType) callLog.networkType = networkType;
     if (callStatus === "completed" && !callLog.startedAt) {
       callLog.startedAt = new Date();
     }
@@ -165,6 +147,12 @@ export const updateCallStatus = async (req, res) => {
 // ================================
 // END CALL
 // PUT /api/calls/:callId/end
+//
+// FIX: Removed double save.
+// Old code called calculateDuration() which internally called
+// this.save(), then called callLog.save() again — two DB writes.
+// Now calculateDuration() only calculates (no save),
+// and we call save() exactly once here.
 // ================================
 export const endCall = async (req, res) => {
   try {
@@ -185,28 +173,17 @@ export const endCall = async (req, res) => {
       callLog.receiver.toString() === userId.toString();
 
     if (!isParticipant) {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized.",
-      });
+      return res.status(403).json({ success: false, message: "Not authorized." });
     }
 
-    // Set end time
     callLog.endedAt = new Date();
+    if (!callLog.startedAt) callLog.startedAt = callLog.initiatedAt;
+    if (callLog.callStatus === "missed") callLog.callStatus = "completed";
 
-    // Set startedAt if not set (edge case)
-    if (!callLog.startedAt) {
-      callLog.startedAt = callLog.initiatedAt;
-    }
+    // FIX: calculateDuration() now only calculates — does NOT call save()
+    callLog.calculateDuration();
 
-    // Calculate duration
-    await callLog.calculateDuration();
-
-    // Update status to completed if not already set
-    if (callLog.callStatus === "missed") {
-      callLog.callStatus = "completed";
-    }
-
+    // FIX: single save() call
     await callLog.save();
 
     return res.status(200).json({
@@ -234,7 +211,7 @@ export const getCallHistory = async (req, res) => {
     const userId = req.user._id;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
-    const callType = req.query.callType; // "audio" | "video" | undefined
+    const callType = req.query.callType;
 
     const query = {
       $or: [{ caller: userId }, { receiver: userId }],
@@ -257,7 +234,6 @@ export const getCallHistory = async (req, res) => {
       CallLog.countDocuments(query),
     ]);
 
-    // Format each call log
     const formattedLogs = callLogs.map((log) => ({
       _id: log._id,
       callType: log.callType,
@@ -298,9 +274,7 @@ export const getCallHistory = async (req, res) => {
 export const getMissedCalls = async (req, res) => {
   try {
     const userId = req.user._id;
-
     const missedCalls = await CallLog.getMissedCalls(userId);
-
     return res.status(200).json({
       success: true,
       count: missedCalls.length,
@@ -338,20 +312,13 @@ export const deleteCallLog = async (req, res) => {
       callLog.receiver.toString() === userId.toString();
 
     if (!isParticipant) {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized.",
-      });
+      return res.status(403).json({ success: false, message: "Not authorized." });
     }
 
-    // Delete only for this user
     callLog.deletedFor.push(userId);
     await callLog.save();
 
-    return res.status(200).json({
-      success: true,
-      message: "Call log deleted.",
-    });
+    return res.status(200).json({ success: true, message: "Call log deleted." });
   } catch (error) {
     console.error("Delete call log error:", error.message);
     return res.status(500).json({
@@ -377,10 +344,7 @@ export const clearAllCallHistory = async (req, res) => {
       { $addToSet: { deletedFor: userId } }
     );
 
-    return res.status(200).json({
-      success: true,
-      message: "Call history cleared.",
-    });
+    return res.status(200).json({ success: true, message: "Call history cleared." });
   } catch (error) {
     console.error("Clear call history error:", error.message);
     return res.status(500).json({
@@ -415,10 +379,7 @@ export const getCallDetails = async (req, res) => {
       callLog.receiver._id.toString() === userId.toString();
 
     if (!isParticipant) {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized.",
-      });
+      return res.status(403).json({ success: false, message: "Not authorized." });
     }
 
     return res.status(200).json({
