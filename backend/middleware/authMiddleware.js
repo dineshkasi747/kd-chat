@@ -7,45 +7,34 @@ import User from "../models/User.js";
 export const protect = async (req, res, next) => {
   try {
     let token;
-
-    // Get token from header
     if (
       req.headers.authorization &&
       req.headers.authorization.startsWith("Bearer")
     ) {
       token = req.headers.authorization.split(" ")[1];
     }
-
     if (!token) {
       return res.status(401).json({
         success: false,
         message: "Not authorized. No token provided.",
       });
     }
-
-    // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Get user from DB
     const user = await User.findById(decoded.id).select(
       "-firebaseUid -fcmToken"
     );
-
     if (!user) {
       return res.status(401).json({
         success: false,
         message: "User not found. Token invalid.",
       });
     }
-
     if (!user.isActive) {
       return res.status(401).json({
         success: false,
         message: "Account has been deactivated.",
       });
     }
-
-    // Attach user to request
     req.user = user;
     next();
   } catch (error) {
@@ -70,21 +59,62 @@ export const protect = async (req, res, next) => {
 
 // ================================
 // VERIFY SOCKET TOKEN
-// used inside socketHandler.js
+// FIX: Added detailed logging so we can see exactly why the socket
+// token is being rejected even when the HTTP token works fine.
 // ================================
 export const verifySocketToken = async (token) => {
   try {
-    if (!token) return null;
+    // Log 1: Check if token arrived at all
+    if (!token) {
+      console.log("❌ verifySocketToken: no token provided");
+      return null;
+    }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Log 2: Check JWT_SECRET is loaded
+    if (!process.env.JWT_SECRET) {
+      console.log("❌ verifySocketToken: JWT_SECRET is undefined — check .env");
+      return null;
+    }
+
+    // Log 3: Show first 30 chars of token so we can confirm it matches
+    console.log("🔍 verifySocketToken: token preview =", token.substring(0, 30) + "...");
+
+    // Decode without verifying first to inspect payload
+    const rawDecoded = jwt.decode(token);
+    console.log("🔍 verifySocketToken: decoded payload =", rawDecoded);
+
+    // Now verify signature + expiry
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (jwtError) {
+      console.log("❌ verifySocketToken: jwt.verify failed —", jwtError.name, ":", jwtError.message);
+      return null;
+    }
+
+    console.log("✅ verifySocketToken: jwt.verify passed, userId =", decoded.id);
+
+    // Look up user
     const user = await User.findById(decoded.id).select(
-      "name profilePic isOnline phoneNumber"
+      "name profilePic isOnline phoneNumber isActive"
     );
 
-    if (!user || !user.isActive) return null;
+    if (!user) {
+      console.log("❌ verifySocketToken: user not found in DB for id =", decoded.id);
+      return null;
+    }
 
+    if (!user.isActive) {
+      console.log("❌ verifySocketToken: user is inactive, id =", decoded.id);
+      return null;
+    }
+
+    console.log("✅ verifySocketToken: user authenticated =", user._id.toString());
     return user;
+
   } catch (error) {
+    // Log 4: Catch anything else
+    console.log("❌ verifySocketToken: unexpected error —", error.message);
     return null;
   }
 };
@@ -105,11 +135,9 @@ export const checkBlocked = async (req, res, next) => {
   try {
     const currentUserId = req.user._id;
     const targetUserId = req.params.userId || req.body.receiverId;
-
     if (!targetUserId) return next();
 
     const targetUser = await User.findById(targetUserId).select("blockedUsers");
-
     if (!targetUser) {
       return res.status(404).json({
         success: false,
@@ -117,15 +145,11 @@ export const checkBlocked = async (req, res, next) => {
       });
     }
 
-    // Check if target has blocked current user
     const isBlockedByTarget = targetUser.blockedUsers.some(
       (id) => id.toString() === currentUserId.toString()
     );
 
-    // Check if current user has blocked target
-    const currentUser = await User.findById(currentUserId).select(
-      "blockedUsers"
-    );
+    const currentUser = await User.findById(currentUserId).select("blockedUsers");
     const hasBlockedTarget = currentUser.blockedUsers.some(
       (id) => id.toString() === targetUserId.toString()
     );
@@ -136,7 +160,6 @@ export const checkBlocked = async (req, res, next) => {
         message: "Action not allowed.",
       });
     }
-
     next();
   } catch (error) {
     return res.status(500).json({
